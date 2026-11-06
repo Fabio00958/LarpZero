@@ -78,7 +78,7 @@ return function(library,tab)
         end
         return data
     end
-    local function load(value)
+    local function load(value,startup)
         prepare()
         local data=codec:JSONDecode(readfile(path(value)))
         if type(data)~="table" or data.Version~=1 or type(data.Options)~="table" or type(data.Toggles)~="table" then
@@ -107,6 +107,19 @@ return function(library,tab)
                         elseif key=="AutoSellDropdown" then
                             local labels={ ["0"]="none",["3"]="3-5",["4"]="4-5",["5"]="5",["none"]="none",["3-5"]="3-5",["4-5"]="4-5" }
                             option:SetValue(labels[tostring(row.Value)] or "5")
+                        elseif key=="EventBossDropdown" then
+                            local labels={CUPID_KILLS_="Cupid",EASTERBUNNY_KILLS_="Easter Bunny",KRAKEN_KILLS_="Kraken",VANE_KILLS_="Vane",FALLENKING_KILLS_="Fallen King",SANTA_KILLS_="Korrupted Klaus"}
+                            option:SetValue(labels[row.Value] or row.Value)
+                        elseif key=="OrbBuffDropdown" then
+                            local labels={DamageBuffOrb="Damage Boost",UltChargeBuffOrb="Ultimate",HealthBuffOrb="Healing",DefenseBuffOrb="Shield"}
+                            local values={}
+                            if type(row.Value)=="table" then
+                                for selected,active in pairs(row.Value)do
+                                    if active==true then values[labels[selected] or selected]=true
+                                    elseif type(active)=="string" then values[labels[active] or active]=true end
+                                end
+                            end
+                            option:SetValue(values)
                         else option:SetValue(row.Value)end
                     end
                 end
@@ -126,6 +139,7 @@ return function(library,tab)
                         end)
                     end
                 end
+                if startup and data.Toggles.HideGuiToggle==true and library.Toggled then library:Toggle()end
             end)
             loading=false
             if not library.Unloaded then library:Notify(ok and "Configuration loaded" or "Configuration could not be fully applied",4)end
@@ -170,13 +184,13 @@ return function(library,tab)
                 if value:match("^[%w_%-]+$") and #value<=48 and isfile(path(value)) then
                     library.Options.ProfileName:SetValue(value)
                     autoload:SetText("Autoload: "..value)
-                    load(value)
+                    load(value,true)
                     chosen=true
                 end
             end
         end)
         if not chosen and getgenv().LarpZeroResumeSettings then
-            pcall(function()load("teleport_resume")end)
+            pcall(function()load("teleport_resume",true)end)
         end
         getgenv().LarpZeroResumeSettings=nil
         if not ok then library:Notify("Saved configuration could not be opened",4)end
@@ -12108,6 +12122,21 @@ EF.CloneRef = cloneref or clonereference or function(value) return value end
 EF.CheckHook = ishooked or isfunctionhooked or is_hooked or is_function_hooked or nil
 
 -- || RETURN SERVICE ||
+-- Native game modules expect normal script identity. Always restore the caller
+-- before updating the executor's protected UI, including after errors/yields.
+local function GameCall(callback,...)
+    local setter=setthreadidentity or setidentity
+    local getter=getthreadidentity or getidentity
+    local previous,changed
+    if type(setter)=="function" and type(getter)=="function" then
+        local ok,value=pcall(getter)
+        if ok then previous=value changed=pcall(setter,2)end
+    end
+    local results=table.pack(pcall(callback,...))
+    if changed then pcall(setter,previous)end
+    return table.unpack(results,1,results.n)
+end
+
 SetGlobal("return things for the script")
 local function ReturnService(Service)
     local ReturnService = game:GetService(Service)
@@ -12802,7 +12831,7 @@ local function MobScanner()
                     ValidMob(Mob)
                 end
                 while not KillSwitch do
-                    if not CanTarget then
+                    if not CanTarget or SV.QuotaPaused then
                         CurrentMob = nil
                         task.wait()
                         continue
@@ -13012,7 +13041,7 @@ local function MobScanner()
                     end)
                 end
                 while not KillSwitch do
-                    if not CanTarget then
+                    if not CanTarget or SV.QuotaPaused then
                         CurrentMob = nil
                         task.wait()
                         continue
@@ -13121,6 +13150,7 @@ end
 
 SetGlobal("replay dungeon loop")
 local function ReplayDungeonLoop(Mission, Difficulty)
+    if type(Mission)~="number" or Mission~=Mission or Mission<=0 or Mission==math.huge then return end
     if Mission==49 then Mission=1 end
     if SV.TransitionPending and SV.TransitionMission==Mission and SV.TransitionDifficulty==Difficulty then return end
     SV.TransitionPending=true
@@ -13139,13 +13169,15 @@ end
 
 SetGlobal("rejoin last dungeon")
 local function RejoinLastDungeon(DoRejoin)
-    if not DoRejoin or SV.TransitionPending then return end
+    if not DoRejoin or not IsDungeon or SV.TransitionPending then return end
     local difficulty=IsTower and nil or GetDifficulty()
     ReplayDungeonLoop(ISV.MissionId,difficulty)
 end
 
 SetGlobal("restart dungeon")
 local function RestartDungeon(RestartBypass)
+    if SV.QuotaPaused then return end
+    if not IsDungeon then return end
     if SV.TransitionPending then return end
     if not (SV.ReplayMission or SV.DoingGuildDungeon or RestartBypass) then 
         return
@@ -13658,10 +13690,7 @@ local function BuyFromLocalShop(ShopData, PurchaseData)
     local Success, Result = pcall(function()
         BuyLocal:InvokeServer(ShopName, Shop.LocalShops[ShopName].Items[Item])
     end)
-    if not Success then
-        
-        return
-    end
+    if not Success or Result~=true then return false end
     Library:Notify("Purchased " ..ItemName.. "!", 1)
     task.wait(0.6)
     return true
@@ -13694,13 +13723,59 @@ local function BuyFromEggShop(Currency, Egg, EggPrice, EggName)
 end
 
 SetGlobal("open menu")
-local function OpenMenu(Menu)
-    local Success, Result = pcall(function()
-        require(Client.Gui):Get(Menu):Open(true)
-    end)
-    if not Success then
-        Library:Notify("Function is unsupported by your executor", 5)
+local QuickMenuController=(function()
+-- Own only the quick-menu session. Native menus retain their own controls and
+-- transactions. Latest clicks wait for the previous menu's close animation.
+local QuickMenus={}
+function QuickMenus.Create(deps)
+    local active,pending,running,closed
+    local controller={}
+    local function release()
+        local previous=active
+        active=nil
+        if previous then previous:Close()end
     end
+    function controller.Request(name)
+        if closed or deps.Stopped()then return false end
+        pending=name
+        if running then return true end
+        running=true
+        local ok=pcall(function()
+            while pending and not closed and not deps.Stopped()do
+                local target=pending
+                pending=nil
+                if active then
+                    release()
+                    deps.Wait(0.3)
+                end
+                if closed or deps.Stopped()then break end
+                if pending then target=pending pending=nil end
+                local menu=deps.Get(target)
+                active=menu -- also owned if Open fails partway through.
+                if target=="PetExpeditions" then
+                    menu:Open(true) -- native board preview entry point.
+                else
+                    menu:Open()
+                end
+            end
+        end)
+        running=false
+        if not ok then pending=nil pcall(release)end
+        return ok
+    end
+    function controller.Close()
+        closed=true
+        pending=nil
+        pcall(release)
+    end
+    return controller
+end
+return QuickMenus
+
+end)().Create({Get=function(name)return require(Client.Gui):Get(name)end,Wait=task.wait,Stopped=function()return ScriptUnloaded end})
+local function OpenMenu(Menu)
+    local ok,opened=GameCall(function()return QuickMenuController.Request(Menu)end)
+    if not ok or not opened then Library:Notify("This game menu is unavailable in the current context",4)end
 end
 
 SetGlobal("upgrade to max")
@@ -14021,6 +14096,27 @@ local function GetPlayerPet(IsCancelled)
     end
 end
 
+local CombatSchedule=(function()
+local Schedule={}
+function Schedule.Create(environment,server,clock)
+    local state=environment.LarpZeroCombatCooldowns
+    if type(state)~="table" or state.Server~=server then
+        state={Server=server,ReadyAt={}}
+        environment.LarpZeroCombatCooldowns=state
+    end
+    local controller={}
+    function controller.Ready(key)return clock()>=(state.ReadyAt[key] or 0)end
+    function controller.Reserve(key,seconds)
+        local duration=tonumber(seconds)or 0
+        if duration~=duration or duration<0 then duration=0 end
+        state.ReadyAt[key]=clock()+duration
+    end
+    return controller
+end
+return Schedule
+
+end)().Create(getgenv(),game.JobId,time)
+
 SetGlobal("get player class")
 local function GetPlayerClass()
     SV.PlayerClass = WaitForAttribute(LocalPlayer, "Class")
@@ -14267,7 +14363,17 @@ local function ItemSellCheck(item,manual)
 end
 
 SetGlobal("check score")
+local function SetQuotaPause(group,enabled)
+    SV.QuotaStops=SV.QuotaStops or {}
+    SV.QuotaStops[group]=enabled and true or nil
+    SV.QuotaPaused=next(SV.QuotaStops)~=nil
+end
 local function GetLeaderboardScore(Leaderboard, TotalLabel, DailyLabel, TotalAllowed, DailyAllowed, EventBoss)
+    TotalAllowed=tonumber(TotalAllowed)
+    DailyAllowed=tonumber(DailyAllowed)
+    if TotalAllowed and (TotalAllowed<=0 or TotalAllowed~=TotalAllowed or TotalAllowed==math.huge) then TotalAllowed=nil end
+    if DailyAllowed and (DailyAllowed<=0 or DailyAllowed~=DailyAllowed or DailyAllowed==math.huge) then DailyAllowed=nil end
+    if not TotalLabel or not DailyLabel or not Leaderboard or Leaderboard=="" then return false end
     local SelectedLeaderboard = tostring(Leaderboard)
     if EventBoss then
         local Date = os.date("*t")
@@ -14292,7 +14398,9 @@ local function GetLeaderboardScore(Leaderboard, TotalLabel, DailyLabel, TotalAll
     TotalLabel:SetText("Total: " ..FormatNumber(TotalScore))
     DailyLabel:SetText("Daily: " ..FormatNumber(DailyScore))
 
-    if (TotalAllowed and TotalScore and TotalScore >= TotalAllowed) or (DailyAllowed and DailyScore and DailyScore >= DailyAllowed) then
+    local reached=(TotalAllowed and TotalScore and TotalScore>=TotalAllowed) or (DailyAllowed and DailyScore and DailyScore>=DailyAllowed)
+    SetQuotaPause(EventBoss and "event" or "nightmare",reached==true)
+    if reached then
         Library:Notify("Limit reached, if you update the limit please restart the dungeon to continue.")
         return true
     end
@@ -14332,7 +14440,8 @@ Library = BundledUI()
 LarpZeroInstance.Library=Library
 LarpZeroInstance.Loading=false
 Library.ScreenGui:SetAttribute("LarpZeroMenu",true)
-Library.ScreenGui:SetAttribute("LarpZeroBuild","2026.11.05-r5")
+Library.ScreenGui:SetAttribute("LarpZeroBuild","2026.11.06-r10")
+Library.ScreenGui:SetAttribute("LarpZeroSourceHash","7da0ce1f9bc9")
 if LarpZeroStartupLock then
     LarpZeroStartupLock:SetAttribute("Loading",false)
     local menu=Instance.new("ObjectValue")
@@ -14343,6 +14452,11 @@ end
 Library:OnUnload(function()
     KillSwitch=true
     ScriptUnloaded=true
+    for name,toggle in pairs(Toggles or {})do
+        if name~="SafeModeToggle" and toggle.Value and type(toggle.Changed)=="function" then
+            pcall(function()toggle.Changed(false)end)
+        end
+    end
     SV.Killaura=nil SV.SafeKillaura=nil SV.Autofarm=nil
     for _,connection in pairs(ConnectionTable) do
         pcall(function()connection:Disconnect()end)
@@ -14576,10 +14690,7 @@ FirstTab:AddToggle("CollectBuffToggle", {
 })
 FirstTab:AddDropdown("OrbBuffDropdown", {
     Values = {
-        DamageBuffOrb = "Damage Boost",
-        UltChargeBuffOrb = "Ultimate",
-        HealthBuffOrb = "Healing",
-        DefenseBuffOrb = "Shield"
+        "Damage Boost","Ultimate","Healing","Shield"
     },
     Multi = true,
     AllowNull = true,
@@ -14588,7 +14699,9 @@ FirstTab:AddDropdown("OrbBuffDropdown", {
     Searchable = true,
     Callback = function(ChangedValue)
         if IsDungeon and Options.OrbBuffDropdown:GetActiveValues(true) > 0 then
-            SV.SelectedOrbs = ChangedValue
+            local labels={["Damage Boost"]="DamageBuffOrb",Ultimate="UltChargeBuffOrb",Healing="HealthBuffOrb",Shield="DefenseBuffOrb"}
+            SV.SelectedOrbs={}
+            for key,enabled in pairs(ChangedValue) do if enabled then SV.SelectedOrbs[labels[key] or key]=true end end
         else
             SV.SelectedOrbs = nil
         end
@@ -14598,12 +14711,7 @@ local TotalLabel, TotalAllowed
 local DailyLabel, DailyAllowed
 SecondTab:AddDropdown("EventBossDropdown", {
     Values = {
-        CUPID_KILLS_ = "Cupid",
-        EASTERBUNNY_KILLS_ = "Easter Bunny",
-        KRAKEN_KILLS_ = "Kraken",
-        VANE_KILLS_ = "Vane",
-        FALLENKING_KILLS_ = "Fallen King",
-        SANTA_KILLS_ = "Korrupted Klaus"
+        "Cupid","Easter Bunny","Kraken","Vane","Fallen King","Korrupted Klaus"
     },
     Multi = false,
     AllowNull = false,
@@ -14611,12 +14719,13 @@ SecondTab:AddDropdown("EventBossDropdown", {
     Text = "Select event boss",
     Searchable = true,
     Callback = function(ChangedValue)
-        if IsWorld or IsDungeon and ChangedValue then
+        local keys={Cupid="CUPID_KILLS_",["Easter Bunny"]="EASTERBUNNY_KILLS_",Kraken="KRAKEN_KILLS_",Vane="VANE_KILLS_",["Fallen King"]="FALLENKING_KILLS_",["Korrupted Klaus"]="SANTA_KILLS_"}
+        ChangedValue=keys[ChangedValue] or ChangedValue
+        if (IsWorld or IsDungeon) and type(ChangedValue)=="string" and ChangedValue~="" then
             task.wait(1)
             if GetLeaderboardScore(ChangedValue, TotalLabel, DailyLabel, TotalAllowed, DailyAllowed, true) then
                 Library:Notify("Event boss clear limit reached.", 999999999)
-                local TempStop = true
-                local CanTarget = false
+                SetQuotaPause("event",true)
             end
         end
     end
@@ -14627,6 +14736,7 @@ SecondTab:AddInput("TotalEventInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("event",false)
         if IsDungeon then
             TotalAllowed = ChangedValue
         end
@@ -14639,41 +14749,165 @@ SecondTab:AddInput("DailyEventInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("event",false)
         if IsDungeon then
             DailyAllowed = ChangedValue
         end
     end
 })
-local CoinSpinLabel = ThirdTab:AddLabel("Coin cost: 5", true)
-local SpinCount = 0
-ThirdTab:AddInput("WheelSpinInput", {
-    Text = "Wheel spin amount",
-    Default = 1,
-    Placeholder = "1",
-    Tooltip = "If you enter more spins than you have in coins then the script will spin the wheel as many times as possible",
-    Callback = function(ChangedValue)
-        if typeof(ChangedValue) == "number" then
-            CoinSpinLabel:SetText("Coin cost: " ..FormatNumber(ChangedValue*5))
-            SpinCount = ChangedValue
-        else
-            SpinCount = 0
-            CoinSpinLabel:SetText("Coin cost: <font color=\"rgb(255, 0, 0)\">invalid number</font>")
-        end
+local EventWheel=(function()
+local Wheel={}
+function Wheel.ParseAmount(value)
+    local number=tonumber(value)
+    if not number or number~=number or number==math.huge or number==-math.huge
+        or number<1 or number%1~=0 or number>10000 then return nil end
+    return number
+end
+function Wheel.Install(tab,library,context)
+    local config=context.Config
+    local spinner=context.Spinner
+    local cost=tonumber(config and config.spinCost)
+    if not cost or cost<=0 or cost~=cost or cost==math.huge then cost=nil end
+    local amount=1
+    local generation=0
+    local state={Running=false,Completed=0,Requested=0,Sent=0,Charged=0}
+    library.LarpZeroWheelState=state
+    local label=tab:AddLabel(cost and ("Coin cost: "..tostring(cost)) or "Coin cost: unavailable",true)
+    local status=tab:AddLabel("Wheel: ready",true)
+    local function setStatus(text)
+        state.Status=text
     end
-})
-ThirdTab:AddButton({
-    Text = "Spin wheel",
-    Tooltip = "High amounts of spins WILL cause lag. I cannot do anything about this.",
-    DoubleClick = true,
-    Func = function()
-        local JoinQueue = Remotes:FindFirstChild("EventSpinner_JoinQueue")
-        for Spin = 1, SpinCount do
-            JoinQueue:FireServer(LocalPlayer)
-            task.wait()
-        end
+    -- Native game calls can lower the worker's UI capabilities. Only this
+    -- executor-owned heartbeat touches the hidden menu; the worker updates data.
+    local rendered
+    local renderer
+    if context.Heartbeat then
+        renderer=context.Heartbeat:Connect(function()
+            if not library.Unloaded and state.Status and state.Status~=rendered then
+                status:SetText("Wheel: "..state.Status)
+                rendered=state.Status
+            end
+        end)
     end
+    tab:AddInput("WheelSpinInput",{
+        Text="Wheel spin amount",Default="1",Placeholder="number or all",
+        Tooltip="Enter all to use all currently available coins, or a whole number from 1 to 10000. Spins advance on confirmed charges without waiting for the wheel animation.",
+        Callback=function(value)
+            amount=type(value)=="string" and value:lower():match("^%s*all%s*$") and "all" or Wheel.ParseAmount(value)
+            if amount=="all" then label:SetText("Coin cost: all available coins")
+            elseif not amount then label:SetText("Coin cost: enter a positive whole number (1–10000)")
+            elseif not cost then label:SetText("Coin cost: unavailable")
+            else label:SetText("Coin cost: "..tostring(amount*cost))end
+        end,
+    })
+    local function stopped(token)
+        return token~=generation or library.Unloaded or context.Stopped()
+    end
+    tab:AddButton({Text="Spin wheel",DoubleClick=true,Tooltip="Rapidly spin on server charge confirmations; prizes can arrive together afterward.",Func=function()
+        if state.Running then setStatus("already spinning; use Cancel spins to stop")return end
+        if not amount or not cost then setStatus("check the amount and event availability")return end
+        if not spinner or not context.ChargeSignal then setStatus("event spinner unavailable")return end
+        generation+=1
+        local token=generation
+        local requested=amount
+        if amount=="all" then
+            local coins=tonumber(context.Currency(spinner.CURRENCY))or 0
+            requested=coins>=0 and coins<math.huge and math.floor(coins/cost)or 0
+            if requested<1 then setStatus("not enough currency")return end
+        end
+        state.Running=true state.Completed=0 state.Requested=requested state.Sent=0 state.Charged=0
+        local connection,chargeConnection
+        task.spawn(function()
+            local ok=pcall(function()
+                state.Phase="connect prize signal"
+                local received=0
+                connection=spinner:GetPrizeReceivedSignal():Connect(function()
+                    if received<state.Sent and not stopped(token)then
+                        received+=1
+                        state.Completed=math.min(received,state.Charged)
+                    end
+                end)
+                chargeConnection=context.ChargeSignal:Connect(function(prizeIndex)
+                    if type(prizeIndex)=="number" and state.Charged<state.Sent and not stopped(token)then
+                        state.Charged+=1
+                        state.Completed=math.min(received,state.Charged)
+                    end
+                end)
+                for index=1,requested do
+                    state.Phase="check availability"
+                    if stopped(token) then setStatus("stopped by cancellation or transition")break end
+                    if not spinner:IsSpinnerActive() then setStatus("not available in this location/event")break end
+                    local coins=context.Currency(spinner.CURRENCY)
+                    if not coins or coins<cost then setStatus("not enough currency")break end
+                    if not spinner:CanJoinQueue(context.Player) then setStatus("already queued or not ready")break end
+                    local before=state.Charged
+                    state.Sent+=1
+                    state.Phase="request queue"
+                    if not spinner:RequestJoinQueue(context.Player)then
+                        state.Sent-=1 setStatus("queue request rejected")break
+                    end
+                    state.Phase="wait for charge"
+                    local deadline=os.clock()+10
+                    while state.Charged==before and not stopped(token)and os.clock()<deadline do task.wait()end
+                    if stopped(token)then break end
+                    if state.Charged==before then setStatus("charge not confirmed; stopped without retrying")break end
+                    setStatus("paid "..state.Charged.."/"..requested.."; prizes "..state.Completed)
+                    task.wait()
+                end
+                if state.Charged>state.Completed and not stopped(token)then
+                    state.Phase="wait for prizes"
+                    local deadline=os.clock()+math.max(30,(tonumber(config.SPINNER_TIMER)or 5)+15)
+                    while state.Completed<state.Charged and not stopped(token)and os.clock()<deadline do task.wait(0.1)end
+                end
+                if not stopped(token)then
+                    if state.Completed==requested then setStatus("completed "..state.Completed.."/"..requested)
+                    elseif state.Charged>state.Completed then setStatus("paid "..state.Charged.."; prizes confirmed "..state.Completed.."; stopped")end
+                end
+            end)
+            if connection then connection:Disconnect()end
+            if chargeConnection then chargeConnection:Disconnect()end
+            state.Running=false
+            if not ok and not library.Unloaded then setStatus("spinner unavailable; stopped")end
+        end)
+    end})
+    tab:AddButton({Text="Cancel spins",Func=function()
+        generation+=1
+        setStatus("cancelled; an accepted spin may still finish")
+    end})
+    library:OnUnload(function()
+        generation+=1
+        state.Running=false
+        if renderer then renderer:Disconnect()end
+    end)
+end
+return Wheel
+
+end)()
+local wheelSpinner,wheelConfig
+pcall(function()
+    wheelSpinner=require(Shared:WaitForChild("EventSpinner",5))
+    wheelConfig=require(ReplicatedStorage.WorldModules:WaitForChild("EventSpinnerConfig",5))
+end)
+if wheelConfig and type(wheelConfig.Rewards)=="table" then
+    SV.WheelItems={}
+    for _,reward in ipairs(wheelConfig.Rewards)do
+        if type(reward)=="table" and type(reward[1])=="string" then table.insert(SV.WheelItems,reward[1])end
+    end
+end
+EventWheel.Install(ThirdTab,Library,{
+    Player=LocalPlayer,Spinner=wheelSpinner,Config=wheelConfig,Heartbeat=RunService.Heartbeat,
+    ChargeSignal=Remotes:FindFirstChild("EventSpinner_QueueUpdated") and Remotes.EventSpinner_QueueUpdated.OnClientEvent,
+    Stopped=function()return ScriptUnloaded or KillSwitch or SV.TransitionPending end,
+    Currency=function(name)
+        local items=ProfileInventory and ProfileInventory:FindFirstChild("Items")
+        local item=items and name and items:FindFirstChild(name)
+        if not item then return 0 end
+        local count=item:FindFirstChild("Count")
+        return count and count.Value or 1
+    end,
 })
-    ThirdTab:AddDivider({Margin = -5})
+
+ThirdTab:AddDivider({Margin=-5})
 local RecyclingItems
 ThirdTab:AddButton({
     Text = "Recycle wheel items",
@@ -14684,6 +14918,7 @@ ThirdTab:AddButton({
             return
         end
         RecyclingItems = true
+        local ok=pcall(function()
         if not SV.CanRequire then
             Library:Notify("Your executor doesn't support this option. Lacks require()", 5)
             return
@@ -14737,7 +14972,9 @@ ThirdTab:AddButton({
 
         SV.RealCosmeticTable = RealItemTable
         RecycleFromInventory("Recycle", SelectedItems)
-        RecyclingItems = nil
+        end)
+        RecyclingItems=nil
+        if not ok then Library:Notify("Wheel cosmetic processing is unavailable; nothing further was requested",4)end
     end
 })
 FourthTab:AddToggle("AutoClaimBattlepass", {
@@ -14776,22 +15013,30 @@ FifthTab:AddButton({
             end
             FindingHidden = true
             CheckForCharacter()
+            local ReturnCFrame=PlayerRoot.CFrame
+            local DailyFlags={}
             local DailiesToTeleportTo = {}
 
             if EventFinderReward then
                 for Index, Object in EventFinderReward.Models:GetChildren() do
-                    table.insert(DailiesToTeleportTo, Object.PrimaryPart)
+                    if Object.PrimaryPart then
+                        table.insert(DailiesToTeleportTo,Object.PrimaryPart)
+                        local index=Object.Name:match("(%d+)$")
+                        if index then DailyFlags[Object.PrimaryPart]="EventFR"..index end
+                    end
                 end
             end
 
             local EventObbyReward = Workspace:FindFirstChild("EventObbyReward", true)
             if EventObbyReward then
-                table.insert(DailiesToTeleportTo, EventObbyReward.Base)
+                table.insert(DailiesToTeleportTo,EventObbyReward.Base)
+                DailyFlags[EventObbyReward.Base]="EventDO"
             end
             
             local EventDailyReward = Workspace:FindFirstChild("EventDailyReward", true)
             if EventDailyReward then
-                table.insert(DailiesToTeleportTo, EventDailyReward.Base)
+                table.insert(DailiesToTeleportTo,EventDailyReward.Base)
+                DailyFlags[EventDailyReward.Base]="EventDR"
             end
             
             if EF.Desync and EF.RaknetFunction.is_enabled() then
@@ -14806,14 +15051,23 @@ FifthTab:AddButton({
             Remotes:WaitForChild("SetMounted", math.huge):FireServer(true)
             task.wait(1)
             for Index, Object in DailiesToTeleportTo do
-                PlayerRoot.CFrame = CFrame.new(Vector3.new(Object.Position.X, Object.Position.Y + (Object.Size.Y / 2), Object.Position.Z))
-                task.wait(0.5)
+                if ScriptUnloaded then break end
+                local key=DailyFlags[Object]
+                local deadline=os.clock()+4
+                repeat
+                    if not Object.Parent or ScriptUnloaded then break end
+                    PlayerRoot.CFrame=CFrame.new(Object.Position+Vector3.new(0,3,0))
+                    task.wait(0.2)
+                    local ok,claimed=GameCall(function()return require(Shared.Events):HasDailyFlag(LocalPlayer,key)end)
+                    if ok and claimed then break end
+                until os.clock()>=deadline
             end
 
             local Spawn = Workspace:FindFirstChild("Spawn")
-            local SpawnSize = Spawn.Size.Y / 2
-            local SpawnPosition = Vector3.new(Spawn.Position.X, Spawn.Position.Y+SpawnSize, Spawn.Position.Z)
-            PlayerRoot.CFrame = CFrame.new(SpawnPosition)
+            if Spawn and Spawn:IsA("BasePart") then
+                local SpawnPosition=Spawn.Position+Vector3.new(0,Spawn.Size.Y/2+3,0)
+                PlayerRoot.CFrame=CFrame.new(SpawnPosition)
+            else PlayerRoot.CFrame=ReturnCFrame end
             task.wait(1)
             Remotes:WaitForChild("SetMounted", math.huge):FireServer(false)
             if EF.Desync and EF.RaknetFunction.is_enabled() then
@@ -14822,8 +15076,9 @@ FifthTab:AddButton({
             CollectCoins()
             FindingHidden = nil
         end)
+        FindingHidden=nil
         if not Success then
-            
+            pcall(function()Remotes:WaitForChild("SetMounted",5):FireServer(false)end)
         end
     end
 }):AddButton({
@@ -14857,25 +15112,16 @@ FifthTab:AddButton({
             table.insert(DailiesToESP, EventDailyReward.Base)
         end
         for i, o in DailiesToESP do
-            if o.ClassName == "Model" then
-                for Index, Descendant in o:GetDescendants() do
-                    if Descendant.ClassName == "Highlight" and Descendant.Name ~= "ESP" then
-                        Descendant:Destroy()
-                        Descendant = nil
-                        continue
-                    end
-                end
-            end
-            if not o:FindFirstChild("ESP") then
+            if not o:FindFirstChild("LarpZeroDailyESP") then
                 local Highlight = Instance.new("Highlight")
                 Highlight.FillTransparency = 0
-                Highlight.Name = "ESP"
+                Highlight.Name = "LarpZeroDailyESP"
                 Highlight.Parent = o
             else
-                if o.ESP.Enabled then
-                    o.ESP.Enabled = false
+                if o.LarpZeroDailyESP.Enabled then
+                    o.LarpZeroDailyESP.Enabled = false
                 else
-                    o.ESP.Enabled = true
+                    o.LarpZeroDailyESP.Enabled = true
                 end
             end
         end
@@ -14898,16 +15144,19 @@ FifthTab:AddButton({
             for Index, Hoop in Hoops:GetChildren() do
                 TeleportingHoops = TeleportingHoops + 1
                 task.spawn(function()
-                    local PreviousPosition = Hoop:GetPivot()
-                    Hoop:PivotTo(CFrame.new(PlayerRoot.Position))
-                    task.wait(.1)
-                    Hoop:PivotTo(PreviousPosition)
-                    TeleportingHoops = TeleportingHoops - 1
+                    pcall(function()
+                        local previous=Hoop:GetPivot()
+                        Hoop:PivotTo(CFrame.new(PlayerRoot.Position))
+                        task.wait(.1)
+                        if Hoop.Parent then Hoop:PivotTo(previous)end
+                    end)
+                    TeleportingHoops-=1
                 end)
             end
         else
             Library:Notify("Go to the event hub if it is available.", 5)
         end
+        repeat task.wait()until TeleportingHoops==0
         TeleportingHoops = nil
     end
 })
@@ -15010,25 +15259,45 @@ local LeftTab = TradeTab:AddLeftTabbox("Left Tabbox")
 local RightTab = TradeTab:AddRightTabbox("Right Tabbox")
     local SecondTab = RightTab:AddTab("Trading")
 
-FirstTab:AddToggle("PlacePlayerShopToggle", {
-    Text = "Auto place player shop",
-    Default = false,
-    Tooltip = "Shop automatically gets removed if turned off",
-    Callback = function(ChangedValue)
-        if ChangedValue then
-            local CheckForShopSpots = Workspace:FindFirstChild("ShopLocations")
-            if CheckForShopSpots then
-                for _, ShopSpots in CheckForShopSpots:GetChildren() do
-                    if ShopSpots.PlayerOwner.Value == nil then
-                        Remotes:WaitForChild("Shop_ClaimShop", math.huge):FireServer(ShopSpots)
-                        Library:Notify("Placed shop!", 2)
-                    end
+local placedOwnShop=false
+local shopGeneration=0
+local function OwnShop()
+    local spots=Workspace:FindFirstChild("ShopLocations")
+    if not spots then return false end
+    for _,spot in ipairs(spots:GetChildren())do
+        local owner=spot:FindFirstChild("PlayerOwner")
+        if owner and owner.Value==LocalPlayer then return true end
+    end
+    return false
+end
+FirstTab:AddToggle("PlacePlayerShopToggle",{
+    Text="Auto place player shop",Default=false,Tooltip="Claims one free spot. Turning off releases a spot claimed by this script after the server cooldown.",
+    Callback=function(enabled)
+        shopGeneration+=1
+        local generation=shopGeneration
+        if enabled then
+            if OwnShop() then return end
+            local spots=Workspace:FindFirstChild("ShopLocations")
+            if not spots then return end
+            for _,spot in ipairs(spots:GetChildren())do
+                local owner=spot:FindFirstChild("PlayerOwner")
+                if owner and not owner.Value then
+                    placedOwnShop=true
+                    Remotes:WaitForChild("Shop_ClaimShop",5):FireServer(spot)
+                    break
                 end
             end
-        else
-            Remotes:WaitForChild("Shop_StopShop", math.huge):FireServer()
+        elseif placedOwnShop then
+            task.spawn(function()
+                for _=1,3 do
+                    if generation~=shopGeneration then return end
+                    Remotes:WaitForChild("Shop_StopShop",5):FireServer()
+                    task.wait(1.1)
+                    if not OwnShop() then placedOwnShop=false return end
+                end
+            end)
         end
-    end
+    end,
 })
 FirstTab:AddDropdown("PlayerShopDropdown", {
     Values = {},
@@ -15054,10 +15323,10 @@ FirstTab:AddButton({
         for Index, Descendant in ShopLocations:GetDescendants() do
             if Descendant:IsA("ObjectValue") then
                 if Descendant.Name == "PlayerOwner" then
-                    if Descendant.Value == PlayerName then
-                        continue
+                    local owner=Descendant.Value
+                    if owner and owner~=LocalPlayer and owner:IsA("Player") then
+                        table.insert(ActivePlayerShops,owner.Name)
                     end
-                    table.insert(ActivePlayerShops, Descendant.Value)
                 end
             end
         end
@@ -15162,7 +15431,7 @@ SecondTab:AddButton({
         if SV.PlayerBeingTraded ~= nil then
             local TradeAccept = Remotes:WaitForChild("Trade_Accept")
             TradeAccept:FireServer(Players[SV.PlayerBeingTraded])
-            SendTrade()
+
         else
             Library:Notify("Last trade not found. Did YOU receive and accept a trade?", 5)
         end
@@ -15639,6 +15908,7 @@ ThirdTab:AddInput("TotalNightmareInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("nightmare",false)
         if IsDungeon then
             SV.StopAfterTotalNightmare = ChangedValue
         end
@@ -15651,6 +15921,7 @@ ThirdTab:AddInput("DailyNightmareInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("nightmare",false)
         if IsDungeon then
             SV.StopAfterDailyNightmare = ChangedValue
         end
@@ -15746,6 +16017,7 @@ ThirdTab:AddInput("TotalKillInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("guild",false)
         if IsDungeon then
             SV.StopAfterTotalPoints = ChangedValue
         end
@@ -15758,6 +16030,7 @@ ThirdTab:AddInput("DailyKillInput", {
     Default = "",
     Placeholder = "number here",
     Callback = function(ChangedValue)
+        SetQuotaPause("guild",false)
         if IsDungeon then
             SV.StopAfterDailyPoints = ChangedValue
         end
@@ -15773,13 +16046,14 @@ local function ClipboardCheck(Copy, Data)
         return true
     end
 
-    if not Options.GuildNamesDropdown.Value then
+    if not Options.GuildNamesDropdown.Value or Options.GuildNamesDropdown.Value=="" then
         SpyOnGuild:SetText("No guild selected")
         return true
     end
 
     if Copy and Data then
-        
+        if type(setclipboard)=="function" then setclipboard(Data)
+        else Library:Notify("Clipboard is unavailable in this executor",3)end
         return true
     end
 end
@@ -15792,7 +16066,8 @@ local function GetGuildPoints(Copy)
     local CachedGuild = GetCache:InvokeServer(string.upper(Options.GuildNamesDropdown.Value))
     local CachedMembers = CachedGuild and CachedGuild.Members
     if not CachedMembers then
-        SV.SpyOnGuild:SetText("This guilds data is no longer available")
+        SpyOnGuild:SetText("This guilds data is no longer available")
+        return
     end
 
     local PlayerPoints = {}
@@ -15810,8 +16085,8 @@ local function GetGuildPoints(Copy)
     )
     if not Copy then
         SpyOnGuild:SetText(StoredPoints)
-    else
-        
+    elseif type(setclipboard)=="function" then
+        setclipboard(StoredPoints)
     end
 end
 local function GetGuildDescription(Copy)
@@ -15824,12 +16099,13 @@ local function GetGuildDescription(Copy)
     local CachedDescription = CachedGuild and CachedGuild.Description
     if not CachedDescription then
         SpyOnGuild:SetText("This guilds data is no longer available")
+        return
     end
     if not Copy then
         SpyOnGuild:SetText(CachedDescription)
         StoredDescription = CachedDescription
-    else
-        
+    elseif type(setclipboard)=="function" then
+        setclipboard(CachedDescription)
     end
 end
 FourthTab:AddDropdown("GuildNamesDropdown", {
@@ -15991,16 +16267,20 @@ for Dropdown, Info in ipairs{
         end
     })
     local AutoBuy
+    local BuyGeneration=0
     Info.Tab:AddToggle(Info.ToggleName, {
         Text = "Buy max selected item",
         Default = false,
         Callback = function(ChangedValue)
+            BuyGeneration+=1
+            local generation=BuyGeneration
             if ChangedValue and (IsWorld or IsDungeon) and StringPlaceID == Info.RequiredWorld then
                 AutoBuy = true
                 local Success, Result = pcall(function()
                     repeat
-                        BuyFromLocalShop(Info.ShopList, SelectedItem)
-                        task.wait()
+                        if ScriptUnloaded or KillSwitch or SV.TransitionPending or generation~=BuyGeneration then break end
+                        if SelectedItem then BuyFromLocalShop(Info.ShopList, SelectedItem)end
+                        task.wait(0.65)
                     until not AutoBuy
                 end)
                 if not Success then
@@ -16051,19 +16331,22 @@ local RightTab = MiscTab:AddRightTabbox("Right Tabbox")
     local ThirdTab = RightTab:AddTab("Extra")
     local FourthTab = RightTab:AddTab("Performance")
 
-local function ToggleMenu(ChangedValue, FirstMenu)
-    local Success, Result = pcall(function()
-        local FoundMenu = PlayerGui:FindFirstChild(FirstMenu)
-        if FoundMenu and ChangedValue then
-            FoundMenu.Enabled = false
-        elseif FoundMenu and not ChangedValue then
-            FoundMenu.Enabled = true
-        end
-    end)
-    if not Success then
-        
+local hiddenMenus={}
+local previousGuiState=setmetatable({},{__mode="k"})
+local function ApplyHiddenMenu(gui)
+    if gui and gui:IsA("ScreenGui") and hiddenMenus[gui.Name] then
+        if previousGuiState[gui]==nil then previousGuiState[gui]=gui.Enabled end
+        gui.Enabled=false
     end
 end
+local function ToggleMenu(enabled,name)
+    hiddenMenus[name]=enabled==true
+    local gui=PlayerGui:FindFirstChild(name)
+    if enabled then ApplyHiddenMenu(gui)
+    elseif gui and previousGuiState[gui]~=nil then gui.Enabled=previousGuiState[gui] previousGuiState[gui]=nil end
+end
+ConnectionTable.LarpZeroHiddenMenus=PlayerGui.ChildAdded:Connect(ApplyHiddenMenu)
+
 ThirdTab:AddInput("JoinPlayerInput", {
     Text = "Enter name",
     Default = "",
@@ -16125,13 +16408,14 @@ FirstTab:AddSlider("WalkspeedSlider", {
     Callback = function(ChangedValue)
         if SV.CanRequire then
             if not rWalkspeedManager then
-                rWalkspeedManager = require(rWalkspeedManager)
+                rWalkspeedManager = require(WalkspeedManager)
             end
             rWalkspeedManager:SetBaseSpeed(tonumber(ChangedValue))
         end
     end
 })
     ThirdTab:AddDivider({Margin = -5})
+local originalClassColor=LocalPlayer:GetAttribute("ClassColor")
 ThirdTab:AddInput("ChangeClassColor", {
     Text = "Change class colors",
     Default = "",
@@ -16139,7 +16423,10 @@ ThirdTab:AddInput("ChangeClassColor", {
     Tooltip = "Changes the colors of your classes attacks on your client only",
     Callback = function(ChangedValue)
         if IsDungeon or IsWorld then
-            LocalPlayer:SetAttribute("ClassColor", ChangedValue)
+            if ChangedValue=="" then LocalPlayer:SetAttribute("ClassColor",originalClassColor)
+            elseif type(ChangedValue)=="string" and ChangedValue:match("^%x%x%x%x%x%x$") then
+                LocalPlayer:SetAttribute("ClassColor",ChangedValue)
+            else Library:Notify("Class color must contain exactly six hexadecimal digits",3)end
         end
     end
 })
@@ -16160,6 +16447,7 @@ end -- for unloaded miscellaneous
 
 local ConfigTab=Window:AddTab({Name="Settings"})
 local cleanSettings=ConfigTab:AddLeftGroupbox("Menu")
+cleanSettings:AddLabel("Build: 2026.11.06-r10 [7da0ce1f9bc9]",true)
 cleanSettings:AddToggle("HideGuiToggle",{Text="Hide on load",Default=false})
 local LoadLocalProfile = InstallLocalProfiles(Library, ConfigTab)
 
@@ -16298,9 +16586,11 @@ if not IsMainMenu then
                 }
                 repeat
                     for _, Attack in Class.Skills do
+                        if ScriptUnloaded or KillSwitch or not SV.Killaura then break end
                         if CurrentMob then
                             local AttackCooldown = Attack.Cooldown
-                            if time() - (Attack.LastUsed or 0) >= AttackCooldown+AddedDelay+PlayerPing then
+                            local key=tostring(SV.PlayerClass)..":"..tostring(Attack.Skill)
+                            if time() - (Attack.LastUsed or 0) >= AttackCooldown+AddedDelay+PlayerPing and CombatSchedule.Ready(key) and CombatSchedule.Ready("dispatch") then
                                 local AttackType = Attack.Type
                                 local MobCollider = CurrentMob:FindFirstChild("Collider")
                                 if MobCollider then
@@ -16317,6 +16607,9 @@ if not IsMainMenu then
                                         end
                                         local FindAttackType = AttackArgs[AttackType]
                                         if FindAttackType then
+                                            if ScriptUnloaded or KillSwitch or not SV.Killaura then break end
+                                            CombatSchedule.Reserve(key,AttackCooldown+AddedDelay+PlayerPing)
+                                            CombatSchedule.Reserve("dispatch",tonumber(DelayAttacks)or 0)
                                             FindAttackType(Attack.Skill, MobSurface)
                                         else
                                             SV.Killaura = nil
@@ -16324,7 +16617,7 @@ if not IsMainMenu then
                                             break
                                         end
                                         Attack.LastUsed = time()
-                                        if DelayAttacks and not IsBoss then
+                                        if DelayAttacks and DelayAttacks>0 then
                                             task.wait(DelayAttacks)
                                         end
                                     end
@@ -16353,85 +16646,42 @@ if not IsMainMenu then
             SV.Killaura = nil
         end
     end)
-    Toggles.SafeKillauraToggle:OnChanged(function(ChangedValue)
-        if ChangedValue and SV.SafeMode and not IsDungeon then
+        local SafeCombatGeneration=0
+    Toggles.SafeKillauraToggle:OnChanged(function(enabled)
+        SafeCombatGeneration+=1
+        local generation=SafeCombatGeneration
+        SV.SafeKillaura=nil
+        if not enabled or (SV.SafeMode and not IsDungeon) then return end
+        if not SV.CanRequire then
+            Library:Notify("Native skill control is unavailable in this executor",4)
             return
         end
- -- killaura
-        if SV.CanRequire and EF.Hook and EF.ClearHook and EF.NewClosure and EF.CheckHook then
-            local Success, Result = pcall(function()
-                local Actions = require(Client.Actions)
-                if ChangedValue then
-                    SV.SafeKillaura = true
-                    if SV.IsRanged then
-                        Library:Notify("adjust class distances in the \"Classes\" tab if you are too far from the mobs to do damage.", 10)
-                    end
-                    CreateHookOnFunction(Actions.IsBusy, true)
-
-                    local SkillNames = {
-                        "Primary", "Skill1", "Skill2", "Skill3", "Ultimate"
-                    }
-                    local AttackCount = 1
-                    for Index, Skill in SkillNames do
-                        if AttackCount == 1 then
-                            task.spawn(function()
-                                repeat
-                                    if CurrentMob then
-                                        Actions:UseSkill(Skill)
-                                    end
-                                    task.wait()
-                                until not (SV.SafeKillaura or KillSwitch)
-                            end)
-                        else
-                            task.spawn(function()
-                                repeat
-                                    if CurrentMob then
-                                        Actions:UseSkill(Skill)
-                                    end
-                                    task.wait(.2)
-                                until not (SV.SafeKillaura or KillSwitch)
-                            end)
+        local ok,actions=GameCall(function()return require(Client.Actions)end)
+        if not ok then return end
+        SV.SafeKillaura=true
+        local names={"Primary","Skill1","Skill2","Skill3","Ultimate"}
+        local nextSkill=1
+        while generation==SafeCombatGeneration and SV.SafeKillaura and not KillSwitch and not ScriptUnloaded do
+            if CurrentMob and not SV.QuotaPaused and not SV.TransitionPending and not SV.DodgingAttack then
+                GameCall(function()
+                    if actions:IsSheathed() then actions:UseSkill("Sheath")return end
+                    -- Respect the game's busy state and cooldowns. Never bypass
+                    -- these gates or dispatch five competing skill workers.
+                    if actions:IsBusy() then return end
+                    for _=1,#names do
+                        local name=names[nextSkill]
+                        nextSkill=nextSkill%#names+1
+                        if not actions:SkillDisabled(name) and not actions:IsOnCooldown(name) then
+                            actions:UseSkill(name)
+                            break
                         end
-                        AttackCount = AttackCount + 1
                     end
-                    while SV.SafeKillaura do
-                        if Actions:IsSheathed() then
-                            Actions:UseSkill("Sheath")
-                        end
-                        task.wait(1)
-                    end
-                else
-                    SV.SafeKillaura = nil
-                    CreateHookOnFunction(Actions.IsBusy, false)
-                end
-            end)
-            if not Success then
-                
+                end)
             end
-        elseif mouse1click and keyclick then
-            local Success, Result = pcall(function()
-                if ChangedValue then
-                    while SV.SafeKillaura do
-                        mouse1click(1, 1)
-                        keyclick(Enum.KeyCode.E)
-                        keyclick(Enum.KeyCode.R)
-                        keyclick(Enum.KeyCode.F)
-                        keyclick(Enum.KeyCode.X)
-                        task.wait()
-                    end
-                else
-                    SV.SafeKillaura = nil
-                end
-            end)
-            if not Success then
-                
-            end
-        else
-            Library:Notify("Your executor doesn't support this", 5)
+            task.wait(math.max(0.1,tonumber(DelayAttacks)or 0))
         end
     end)
-    local CurrentCamera = Workspace.CurrentCamera
-    local AutofarmChanged
+
     Toggles.AutoProgressToggle:OnChanged(function(ChangedValue)
         if ChangedValue and SV.SafeMode and not IsDungeon then
             return
@@ -16455,7 +16705,7 @@ if not IsMainMenu then
                         if KillSwitch then
                             break
                         end
-                        if TempStop or HoldForRealTime or EventOverride then
+                        if TempStop or HoldForRealTime or EventOverride or SV.QuotaPaused then
                             if TeleportTween then
                                 TeleportTween:Cancel()
                                 TeleportTween = nil
@@ -16519,7 +16769,7 @@ if not IsMainMenu then
                     end
                     while SV.Autofarm do
                         for Part, PartData in TeleportParts do
-                            if not SV.StopTeleportingParts then
+                            if not SV.StopTeleportingParts and not SV.QuotaPaused then
                                 if PartData.DontTeleport then
                                     continue
                                 end
@@ -16770,6 +17020,7 @@ if not IsMainMenu then
         if TimeActivated ~= RestartChanged then
             return
         end
+        if ChangedValue and not IsDungeon then return end
         if ChangedValue then
             local Success, Result = pcall(function()
                 ISV.LoggedDifficulty = GetDifficulty()
@@ -16777,7 +17028,7 @@ if not IsMainMenu then
                 RejoinLastDungeon(false)
                 local CombatTimer = 0
                 repeat
-                    if SV.TransitionPending or IsMissionOver() then
+                    if not (SV.Autofarm or SV.Killaura or SV.SafeKillaura) or TempStop or SV.DodgingAttack or SV.QuotaPaused or SV.TransitionPending or IsMissionOver() then
                         CombatTimer=0
                         task.wait(1)
                         continue
@@ -16801,7 +17052,7 @@ if not IsMainMenu then
                         end
                     end
                     task.wait(.1)
-                until not CheckForRejoin
+                until not CheckForRejoin or TimeActivated~=RestartChanged or ScriptUnloaded or KillSwitch
             end)
             if not Success then
                 
@@ -16875,8 +17126,8 @@ if IsDungeon then
             CollectBuffs = true
             while CollectBuffs and not KillSwitch do
                 if SV.SelectedOrbs then
-                    for Index, Orb in SV.SelectedOrbs do
-                        if not Orb then
+                    for Orb, enabled in SV.SelectedOrbs do
+                        if not enabled then
                             continue
                         end
                         local FoundOrb = Workspace:FindFirstChild(Orb)
@@ -16919,19 +17170,19 @@ if not IsMainMenu then
                     local ClaimStart = time() + 3
                     if not Paid then
                         repeat
-                            if time() > ClaimStart then
+                            if ScriptUnloaded or KillSwitch or not Toggles.AutoClaimBattlepass.Value or time()>ClaimStart then
                                 break
                             end
                             RedeemItem:FireServer(Rank)
-                            task.wait()
+                            task.wait(0.25)
                         until RedeemedItem:InvokeServer(Rank)
                     else
                         repeat
-                            if time() > ClaimStart then
+                            if ScriptUnloaded or KillSwitch or not Toggles.AutoClaimBattlepass.Value or time()>ClaimStart then
                                 break
                             end
                             RedeemItem:FireServer(Rank, true)
-                            task.wait()
+                            task.wait(0.25)
                         until RedeemedItem:InvokeServer(Rank, true)
                     end
                 end
@@ -16939,6 +17190,7 @@ if not IsMainMenu then
                 repeat
                     local Tracks = { Remotes:WaitForChild("Battlepass_GetItemRanks", math.huge):InvokeServer() }
                     for Track = 1, #Tracks do
+                        if ScriptUnloaded or KillSwitch or not Toggles.AutoClaimBattlepass.Value then break end
                         local Rank = Tracks[Track]
                         local NextTier = rBattlepass:FindNextItemTier(Tracks[Track])
                         if Track == 1 and not FreeClaimed then
@@ -16960,7 +17212,7 @@ if not IsMainMenu then
                         task.wait()
                     end
                     task.wait()
-                until FreeClaimed and PaidClaimed
+                until (FreeClaimed and PaidClaimed)or ScriptUnloaded or KillSwitch or not Toggles.AutoClaimBattlepass.Value
                 ClaimingBattlepass = false
             else
                 Library:Notify("Your executor doesn't support this option")
@@ -17643,20 +17895,17 @@ if IsDungeon then
     end)
 end
 
-local PreventAfk
-Toggles.AFKToggle:OnChanged(function(ChangedValue) -- anti afk
-    if ChangedValue then
-        PreventAfk = true
-        while PreventAfk do
-            if KillSwitch then
-                break
+Toggles.AFKToggle:OnChanged(function(enabled)
+    DisconnectVariable("LarpZeroIdle")
+    if enabled then
+        ConnectionTable.LarpZeroIdle=LocalPlayer.Idled:Connect(function()
+            if not ScriptUnloaded and Toggles.AFKToggle.Value then
+                pcall(function()
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.new(0,0))
+                end)
             end
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new(0, 0))
-            task.wait(10)
-        end
-    else
-        PreventAfk = nil
+        end)
     end
 end)
 if IsMainMenu then
@@ -17667,7 +17916,7 @@ if IsMainMenu then
                 if not ChangedValue then
                     return
                 end
-                while not (KillSwitch or ScriptUnloaded) do
+                while Toggles.MainMenuPlay.Value and not (KillSwitch or ScriptUnloaded) do
                     firesignal(PlayButton.MouseButton1Click)
                     task.wait(.5)
                 end
@@ -17685,24 +17934,30 @@ if IsWorld then
     end)
 end
 if not IsMainMenu then
-    Toggles.RemoveOtherPlayersToggle:OnChanged(function(ChangedValue) -- remove other players
-        if ChangedValue then
-            local CharacterFolder = Workspace:FindFirstChild("Characters")
-            for _, CheckCharacters in CharacterFolder:GetChildren() do
-                if CheckCharacters.Name == PlayerName then continue end
-
-                CheckCharacters:Destroy()
-                CheckCharacters = nil
+    local hiddenCharacters={}
+    local function HideOtherCharacter(character)
+        local owner=Players:GetPlayerFromCharacter(character)
+        if owner and owner~=LocalPlayer and Toggles.RemoveOtherPlayersToggle.Value then
+            if not hiddenCharacters[character] then hiddenCharacters[character]={Parent=character.Parent,Owner=owner}end
+            character.Parent=nil
+        end
+    end
+    Toggles.RemoveOtherPlayersToggle:OnChanged(function(enabled)
+        DisconnectVariable("ConnectCharacterFolder")
+        if enabled then
+            local folder=Workspace:FindFirstChild("Characters")
+            if folder then
+                for _,character in ipairs(folder:GetChildren())do HideOtherCharacter(character)end
+                ConnectionTable.ConnectCharacterFolder=folder.ChildAdded:Connect(function(character)
+                    task.wait(0.1)
+                    HideOtherCharacter(character)
+                end)
             end
-            ConnectionTable["ConnectCharacterFolder"] = CharacterFolder.ChildAdded:Connect(function(AddedCharacter)
-                task.wait(0.1)
-                if AddedCharacter.Name == PlayerName then return end
-                
-                AddedCharacter:Destroy()
-                AddedCharacter = nil
-            end)
         else
-            DisconnectVariable("ConnectCharacterFolder")
+            for character,data in pairs(hiddenCharacters)do
+                if data.Owner.Character==character and data.Parent then pcall(function()character.Parent=data.Parent end)end
+                hiddenCharacters[character]=nil
+            end
         end
     end)
     Toggles.MobESPToggle:OnChanged(function(ChangedValue) -- mob esp
@@ -17710,6 +17965,7 @@ if not IsMainMenu then
             for _, Mob in Mobs:GetChildren() do
                 if Mob then
                     local Highlight = Instance.new("Highlight")
+                    Highlight.Name="LarpZeroMobHighlight"
                     Highlight.FillTransparency = 0
                     Highlight.Parent = Mob
                 end
@@ -17717,6 +17973,7 @@ if not IsMainMenu then
             ConnectionTable["ConnectMobFolder"] = Mobs.ChildAdded:Connect(function(NewMob)
                 if NewMob then
                     local Highlight = Instance.new("Highlight")
+                    Highlight.Name="LarpZeroMobHighlight"
                     Highlight.FillTransparency = 0
                     Highlight.Parent = NewMob
                 end
@@ -17724,7 +17981,7 @@ if not IsMainMenu then
         else
             DisconnectVariable("ConnectMobFolder")
             for _, MobFolder in Mobs:GetChildren() do
-                local MobHighlight = MobFolder and MobFolder:FindFirstChild("Highlight", true)
+                local MobHighlight = MobFolder and MobFolder:FindFirstChild("LarpZeroMobHighlight", true)
                 if MobHighlight then
                     MobHighlight:Destroy()
                     MobHighlight = nil
@@ -17732,23 +17989,31 @@ if not IsMainMenu then
             end
         end
     end)
+    local originalCameraMode
     Toggles.NoclipCameraToggle:OnChanged(function(ChangedValue) -- noclip camera
         if ChangedValue then
-            LocalPlayer.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam
-        else
-            LocalPlayer.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Zoom
+            if originalCameraMode==nil then originalCameraMode=LocalPlayer.DevCameraOcclusionMode end
+            LocalPlayer.DevCameraOcclusionMode=Enum.DevCameraOcclusionMode.Invisicam
+        elseif originalCameraMode~=nil then
+            LocalPlayer.DevCameraOcclusionMode=originalCameraMode
+            originalCameraMode=nil
         end
     end)
-    local JumpChanged
-    Toggles.DisableAutoJumpToggle:OnChanged(function(ChangedValue) -- disable auto jump
-        local TimeActivated = os.clock()
-        JumpChanged = CheckForCharacter(TimeActivated)
-        if TimeActivated ~= JumpChanged then
-            return
+    local savedJump=setmetatable({},{__mode="k"})
+    local function ApplyAutoJump(character)
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid and Toggles.DisableAutoJumpToggle.Value then
+            if savedJump[humanoid]==nil then savedJump[humanoid]=humanoid.AutoJumpEnabled end
+            humanoid.AutoJumpEnabled=false
         end
-        if ChangedValue then
-            PlayerCharacter.Humanoid.AutoJumpEnabled = false
-        end
+    end
+    Toggles.DisableAutoJumpToggle:OnChanged(function(enabled)
+        if enabled then ApplyAutoJump(LocalPlayer.Character)
+        else for humanoid,value in pairs(savedJump)do if humanoid.Parent then humanoid.AutoJumpEnabled=value end savedJump[humanoid]=nil end end
+    end)
+    ConnectionTable.LarpZeroJump=LocalPlayer.CharacterAdded:Connect(function(character)
+        character:WaitForChild("Humanoid",5)
+        ApplyAutoJump(character)
     end)
     ISV.RenderingScreen = MakeGuiElement("ScreenGui", {
         IgnoreGuiInset = true,
@@ -17790,12 +18055,17 @@ if not IsMainMenu then
         end
     end)
     local SetUpFakeModel
+    local FakeModelTemplate
     Toggles.PreventMobToggle:OnChanged(function(ChangedValue) -- stop rendering new things
         if SV.CanRequire and EF.Hook and EF.ClearHook and EF.NewClosure and EF.CheckHook then
             local Success, Result = pcall(function()
                 local GetModel = require(ModelProvider).GetModel
                 if ChangedValue then
-                    local Shockball = SharedAssets.Effects.Models.Shockball
+                    if not FakeModelTemplate then
+                        FakeModelTemplate=SharedAssets.Effects.Models.Shockball:Clone()
+                        SetUpFakeModel=nil
+                    end
+                    local Shockball=FakeModelTemplate
                     if not SetUpFakeModel then
                         if not Shockball:FindFirstChild("HumanoidRootPart") then
                             Shockball.Part.Color = Color3.fromRGB(255, 0, 0)
@@ -17808,7 +18078,7 @@ if not IsMainMenu then
 
                     local ModelHook
                     ModelHook = EF.Hook(GetModel, EF.NewClosure(function(self, model)
-                        if not string.find(model, "Pet") then
+                        if type(model)=="string" and not string.find(model, "Pet") then
                             return Shockball:Clone()
                         else
                             return ModelHook(self, model)
@@ -17816,6 +18086,7 @@ if not IsMainMenu then
                     end))
                 else
                     CreateHookOnFunction(GetModel, false)
+                    if FakeModelTemplate then FakeModelTemplate:Destroy() FakeModelTemplate=nil SetUpFakeModel=nil end
                 end
             end)
             if not Success then
@@ -17825,9 +18096,7 @@ if not IsMainMenu then
             local Success, Result = pcall(function()
                 local GetModel = Remotes:FindFirstChild("ModelProvider_GetModel")
                 if ChangedValue and GetModel then
-                    SV.RemovedModels = true
-                    GetModel:Destroy()
-                    GetModel = nil
+                    Library:Notify("Model filtering requires reversible function hooks in this executor",5)
                 else
                     if SV.RemovedModels then
                         Library:Notify("Rejoin to see assets", 5)
@@ -17864,6 +18133,92 @@ if not IsMainMenu then
     end)
 end
 end -- for unloaded miscellaneous tab
+
+Library:OnUnload(function()GameCall(function()QuickMenuController.Close()end)end)
+local InstallDeveloperGuard=(function()
+return function(toggle,context)
+    local generation=0
+    local connection
+    local leaving=false
+    toggle:OnChanged(function(enabled)
+        generation+=1
+        local token=generation
+        leaving=false
+        if connection then connection:Disconnect()connection=nil end
+        if not enabled then return end
+        local function check(player)
+            if player==context.Player then return end
+            task.spawn(function()
+                local ok,staff=context.IsStaff(player)
+                if token==generation and toggle.Value and not leaving and not context.Stopped() and ok and staff==true then
+                    leaving=true
+                    context.Leave()
+                end
+            end)
+        end
+        connection=context.PlayerAdded:Connect(check)
+        for _,player in ipairs(context.Players())do check(player)end
+    end)
+    context.OnUnload(function()
+        generation+=1
+        if connection then connection:Disconnect()end
+    end)
+end
+
+end)()
+InstallDeveloperGuard(Toggles.DevKickToggle,{
+    Player=LocalPlayer,PlayerAdded=Players.PlayerAdded,Players=function()return Players:GetPlayers()end,
+    IsStaff=function(player)return GameCall(function()return require(Shared.Admin):IsAdmin(player,true)end)end,
+    Leave=function()GameCall(function()LocalPlayer:Kick("A game staff account joined this server")end)end,
+    Stopped=function()return ScriptUnloaded end,
+    OnUnload=function(callback)Library:OnUnload(callback)end,
+})
+local InstallTradeMenu=(function()
+return function(library,button,context)
+    local lastPartner
+    local function remember()
+        local ok,trade=context.CurrentTrade()
+        if not ok or not trade then return end
+        for _,participant in ipairs(trade:GetChildren())do
+            local other=context.FindPlayer(participant.Name)
+            if other and other~=context.Player then lastPartner=other return end
+        end
+    end
+    local connection=context.Updated:Connect(remember)
+    remember()
+    -- Only the current counterpart is kept in memory for this explicit button.
+    button.Func=function()
+        remember()
+        if not lastPartner or not context.Present(lastPartner) then
+            library:Notify("No previous trade partner is available in this server",4)
+            return
+        end
+        context.Invite(lastPartner)
+    end
+    library:OnUnload(function()
+        connection:Disconnect()
+        lastPartner=nil
+    end)
+end
+
+end)()
+local tradeOk,tradeApi=GameCall(function()return require(Shared.Trade)end)
+if tradeOk and tradeApi then
+    local updatedOk,updated=GameCall(function()return tradeApi:GetUpdatedSignal()end)
+    if updatedOk and updated then
+        for _,button in pairs(Library.Buttons)do
+            if button.Text=="Trade with last person" then
+                InstallTradeMenu(Library,button,{
+                    Player=LocalPlayer,Updated=updated,
+                    CurrentTrade=function()return GameCall(function()return tradeApi:GetTradeForPlayer(LocalPlayer)end)end,
+                    FindPlayer=function(name)return Players:FindFirstChild(name)end,
+                    Present=function(player)return player.Parent==Players end,
+                    Invite=function(player)return GameCall(function()return tradeApi:InviteToTrade(LocalPlayer,player)end)end,
+                })
+            end
+        end
+    end
+end
 
 SetGlobal("getting mission id")
 if IsDungeon then
@@ -17904,6 +18259,20 @@ if not IsMainMenu and not KillSwitch then
     end
 end
 
+ConnectionTable.LarpZeroClassState=LocalPlayer:GetAttributeChangedSignal("Class"):Connect(function()
+    local name=LocalPlayer:GetAttribute("Class")
+    SV.PlayerClass=name
+    ISV.PlayerClass=name
+    local data=ClassSkills and ClassSkills[name]
+    if data then
+        Class=BuildAttackData(ClassSkills,name)
+        local ranged=data.Distance=="Ranged"
+        SV.IsRanged=ranged and true or nil
+        local x=Options[ranged and "ChangedRangedXSlider" or "ChangedMeleeXSlider"]
+        local y=Options[ranged and "ChangedRangedYSlider" or "ChangedMeleeYSlider"]
+        if x and y then Xdistance=x.Value Ydistance=y.Value end
+    else Class=nil end
+end)
 SetGlobal("require() check")
 if not IsMainMenu then
     local Success, Result = pcall(function()
@@ -18771,7 +19140,7 @@ if not ISV.IsMobile and EF.HideGui and not SV.BadExecutor then
 end
 
 SetGlobal("toggle menu")
-if Toggles.HideGuiToggle.Value then
+if Toggles.HideGuiToggle.Value and Library.Toggled then
     Library:Toggle()
 end
 
@@ -18801,8 +19170,7 @@ if IsWorld or IsDungeon then
                 SV.DailyGuildPointLabel:SetText("Daily Guild Points: " ..FormatNumber(GuildPointDaily))
                 if (GuildPointTotalLimit and (GuildPointTotal >= GuildPointTotalLimit)) or (GuildPointDailyLimit and (GuildPointDaily >= GuildPointDailyLimit)) then
                     Library:Notify("Guild point limit reached.", 999999999)
-                    CanTarget = false
-                    TempStop = true
+                    SetQuotaPause("guild",true)
                     if SV.GuildPing then
                         PingForCap("Guild Point")
                     end

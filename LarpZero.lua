@@ -35,8 +35,8 @@ local InstallLocalProfiles=(function()
 return function(library,tab)
     local folder="LarpZeroProfiles"
     local codec=game:GetService("HttpService")
-    local group=tab:AddRightGroupbox("Local configurations")
-    local excluded={ProfileName=true}
+    local group=tab:AddRightGroupbox("Configuration")
+    local excluded={ProfileName=true,ConfigListSelect=true,ConfigJSON=true}
     local loading=false
     local function ready()
         return type(readfile)=="function" and type(writefile)=="function"
@@ -135,31 +135,89 @@ return function(library,tab)
         prepare()
         writefile(path("teleport_resume"),codec:JSONEncode(capture()))
     end
-    group:AddInput("ProfileName",{Text="Configuration name",Default="default",Placeholder="Letters, numbers, dash or underscore"})
-    group:AddButton({Text="Save configuration",Func=function()action(function()
-        prepare() writefile(path(name()),codec:JSONEncode(capture())) library:Notify("Configuration saved",3)
+    local function names()
+        local out={}
+        if type(listfiles)=="function" and ready() and isfolder(folder) then
+            local ok,files=pcall(listfiles,folder)
+            if ok and type(files)=="table" then
+                for _,file in ipairs(files) do
+                    local base=tostring(file):match("([^/\\]+)%.json$")
+                    if base and base~="teleport_resume" then out[#out+1]=base end
+                end
+            end
+        end
+        table.sort(out)
+        return out
+    end
+    local function refresh()
+        local option=library.Options.ConfigListSelect
+        if not option then return end
+        local list=names()
+        local keep=option.Value
+        option:SetValues(list)
+        if type(keep)=="string" and table.find(list,keep) then option:SetValue(keep) else option:SetValue(nil) end
+    end
+    local function picked()
+        local value=library.Options.ConfigListSelect.Value
+        if type(value)~="string" or value=="" then return name() end
+        if not value:match("^[%w_%-]+$") or #value>48 then error("Invalid profile name") end
+        return value
+    end
+    group:AddInput("ProfileName",{Text="Config name",Default="",Placeholder="Letters, numbers, dash or underscore"})
+    group:AddButton({Text="Create config",Func=function()action(function()
+        prepare() local value=name()
+        if isfile(path(value)) then library:Notify("Config already exists. Use Overwrite config.",4) return end
+        writefile(path(value),codec:JSONEncode(capture()))
+        refresh() library:Notify("Config created",3)
     end)end})
-    group:AddButton({Text="Load configuration",Func=function()action(function()load(name())end)end})
-    group:AddButton({Text="Delete configuration",DoubleClick=true,Func=function()action(function()
+    group:AddDropdown("ConfigListSelect",{Values=names(),Multi=false,Text="Config list",AllowNull=true})
+    group:AddButton({Text="Load config",Func=function()action(function()load(picked())end)end})
+    group:AddButton({Text="Overwrite config",DoubleClick=true,Func=function()action(function()
+        prepare() local value=picked()
+        if not isfile(path(value)) then error("Config not found")end
+        writefile(path(value),codec:JSONEncode(capture()))
+        library:Notify("Config overwritten",3)
+    end)end})
+    group:AddButton({Text="Delete config",DoubleClick=true,Func=function()action(function()
         prepare()
         if type(delfile)~="function" then error("Delete unavailable")end
-        local value=name()
+        local value=picked()
         if isfile(path(value)) then delfile(path(value))end
         if isfile(folder.."/autoload.txt") and readfile(folder.."/autoload.txt")==value then delfile(folder.."/autoload.txt")end
-        library:Notify("Configuration deleted",3)
+        refresh() library:Notify("Config deleted",3)
     end)end})
-    local autoload=group:AddLabel("Autoload: none")
-    group:AddButton({Text="Autoload this configuration",Func=function()action(function()
-        prepare() local value=name()
-        if not isfile(path(value)) then error("Save configuration first")end
+    group:AddButton({Text="Refresh list",Func=function()action(function()prepare() refresh()end)end})
+    local autoload=group:AddLabel("Current autoload config: none")
+    group:AddButton({Text="Set as autoload",Func=function()action(function()
+        prepare() local value=picked()
+        if not isfile(path(value)) then error("Create the config first")end
         writefile(folder.."/autoload.txt",value)
-        autoload:SetText("Autoload: "..value)
+        autoload:SetText("Current autoload config: "..value)
     end)end})
-    group:AddButton({Text="Clear autoload",Func=function()action(function()
+    group:AddButton({Text="Reset autoload",Func=function()action(function()
         prepare()
         if type(delfile)~="function" then error("Delete unavailable")end
         if isfile(folder.."/autoload.txt") then delfile(folder.."/autoload.txt")end
-        autoload:SetText("Autoload: none")
+        autoload:SetText("Current autoload config: none")
+    end)end})
+    group:AddInput("ConfigJSON",{Text="Config JSON",Default="",Placeholder="Paste config JSON here"})
+    group:AddButton({Text="Import config",Func=function()action(function()
+        prepare()
+        local data=codec:JSONDecode(library.Options.ConfigJSON.Value)
+        if type(data)~="table" or data.Version~=1 or type(data.Options)~="table" or type(data.Toggles)~="table" then
+            error("Invalid config JSON")
+        end
+        local value=name()
+        writefile(path(value),codec:JSONEncode(data))
+        refresh() library:Notify("Imported as "..value..". Select it, then press Load config.",5)
+    end)end})
+    group:AddButton({Text="Export config",Func=function()action(function()
+        local encoded=codec:JSONEncode(capture())
+        if type(setclipboard)=="function" then
+            setclipboard(encoded) library:Notify("Config JSON copied to clipboard",3)
+        else
+            library.Options.ConfigJSON:SetValue(encoded) library:Notify("Config JSON placed in the box above",4)
+        end
     end)end})
     return function()
     if ready() then
@@ -169,7 +227,7 @@ return function(library,tab)
                 local value=readfile(folder.."/autoload.txt")
                 if value:match("^[%w_%-]+$") and #value<=48 and isfile(path(value)) then
                     library.Options.ProfileName:SetValue(value)
-                    autoload:SetText("Autoload: "..value)
+                    autoload:SetText("Current autoload config: "..value)
                     load(value)
                     chosen=true
                 end
@@ -12191,7 +12249,7 @@ local Options
 local Toggles
 local ScriptUnloaded
 local SV = {}
-SV.SafeMode = true
+SV.SafeMode = false
 SV.Drops = {}
 local ISV = {}
 ISV.MobTable = {}
@@ -14435,12 +14493,6 @@ local function ApplySafeMode(enabled)
     end
 end
 SV.RefreshSafeMode=ApplySafeMode
-FirstTab:AddToggle("SafeModeToggle", {
-    Text = "TOGGLE SAFE MODE",
-    Default = true,
-    Tooltip = "Block combat and autofarm outside dungeons.",
-    Callback = ApplySafeMode
-})
 
 CreateToggles({
     { "KillauraToggle", Text = "Killaura", Tab = FirstTab, AttachedFunction = ToggleSafeKillaura },
@@ -14451,7 +14503,7 @@ CreateToggles({
     { "RestartStuckToggle", Text = "Rejoin if stuck", Tooltip = "if you stop doing damage for a long enough period of time this toggle will assume you're stuck and attempt to restart the dungeon.", Tab = ThirdTab },
     { "DodgeLethalToggle", Text = "Dodge lethal damage", Tooltip = "Melee classes only. Some attacks may automatically be dodged even when turned off.", Tab = ThirdTab },
 })
-ApplySafeMode(true)
+ApplySafeMode(false)
 SecondTab:AddLabel("Account for ping", true)
 SecondTab:AddSlider("PingSlider", {
     Text = "Ping",
@@ -15183,9 +15235,10 @@ RightTab = ClassTab:AddRightTabbox("Right Tabbox")
 
 CreateToggles({
     { "GeneralClassBuffToggle", Text = "General class buffs", Tooltip = "Gives you Dual Wielders and Guardians buff", Tab = FirstTab },
-    { "MoLBarrierToggle", Text = "MoL barrier", Tooltip = "Gives everyone else in the game a barrier instead of only yourself\nOnly Mage of Light can use this", Tab = SecondTab },
-    { "DemonBloodBindingToggle", Text = "Demon Blood Binding", Tooltip = "Activates Demons Blood Binding skill that takes away health while boosting your own damage\nOnly Demon can use this", Tab = SecondTab },
-    { "StormcallerSuperchargeToggle", Text = "Stormcaller Supercharge", Tooltip = "Activates Stormcallers Supercharge skill that takes away health while boosting your own damage and healing you a little when inflicting the Supercharge status\nOnly Stormcaller can use this", Tab = SecondTab },
+    { "MoLBarrierToggle", Text = "MoL barrier", Tooltip = "Gives everyone else in the game a barrier instead of only yourself\nTries to work on any class", Tab = SecondTab },
+    { "DemonBloodBindingToggle", Text = "Demon Blood Binding", Tooltip = "Activates Demons Blood Binding skill that takes away health while boosting your own damage\nTries to work on any class", Tab = SecondTab },
+    { "StormcallerSuperchargeToggle", Text = "Stormcaller Supercharge", Tooltip = "Activates Stormcallers Supercharge skill that takes away health while boosting your own damage and healing you a little when inflicting the Supercharge status\nTries to work on any class", Tab = SecondTab },
+    { "CrusaderBuffToggle", Text = "Crusader buffs", Tooltip = "Fires the Crusader Rally and Armament skills again every time they come off cooldown\nTries to work on any class", Tab = SecondTab },
 })
 
 local RangedClassLabel = FirstTab:AddLabel("Ranged class distance", false)
@@ -16158,9 +16211,46 @@ FourthTab:AddSlider("FPSSlider", {
 })
 end -- for unloaded miscellaneous
 
-local ConfigTab=Window:AddTab({Name="Settings"})
-local cleanSettings=ConfigTab:AddLeftGroupbox("Menu")
-cleanSettings:AddToggle("HideGuiToggle",{Text="Hide on load",Default=false})
+local ConfigTab=Window:AddTab({Name="Configurations"})
+local cleanSettings=ConfigTab:AddLeftGroupbox("Main")
+cleanSettings:AddToggle("HideGuiToggle",{Text="Hide menu when executed",Default=false})
+Library.QueueAutoExecute=function()
+    local queue=queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    if type(queue)~="function" then Library:Notify("Your executor does not support queue_on_teleport",5) return end
+    local url=Library.Options.AutoExecuteURL and Library.Options.AutoExecuteURL.Value
+    if type(url)~="string" or url:sub(1,8)~="https://" then Library:Notify("Auto execute URL must start with https://",5) return end
+    queue(string.format('local f="LarpZeroProfiles/autoexec_off.txt" if type(isfile)=="function" and isfile(f) then return end loadstring(game:HttpGet(%q))()',url))
+end
+Library.SetAutoExecuteFlag=function(enabled)
+    pcall(function()
+        if type(isfolder)~="function" or type(makefolder)~="function" or type(writefile)~="function" then return end
+        if not isfolder("LarpZeroProfiles") then makefolder("LarpZeroProfiles") end
+        local flag="LarpZeroProfiles/autoexec_off.txt"
+        if enabled then
+            if type(delfile)=="function" and isfile(flag) then delfile(flag) end
+        else
+            writefile(flag,"1")
+        end
+    end)
+end
+cleanSettings:AddToggle("AutoExecuteToggle",{Text="Auto execute script",Default=false,
+    Tooltip="Runs the script again after you teleport to another server\nNeeds queue_on_teleport support in your executor",
+    Callback=function(enabled)
+        Library.SetAutoExecuteFlag(enabled)
+        if enabled then pcall(Library.QueueAutoExecute) end
+    end})
+cleanSettings:AddInput("AutoExecuteURL",{Text="Auto execute URL",Default="https://raw.githubusercontent.com/Fabio00958/NovaZero/main/LarpZero.lua",Placeholder="Raw .lua link (https://...)"})
+cleanSettings:AddButton({Text="Stop script from executing",Func=function()
+    Library.SetAutoExecuteFlag(false)
+    pcall(function() Library.Toggles.AutoExecuteToggle:SetValue(false) end)
+    pcall(function() if type(clear_teleport_queue)=="function" then clear_teleport_queue() end end)
+    Library:Notify("Auto execute stopped",3)
+end})
+cleanSettings:AddButton({Text="Kill the script",Risky=true,DoubleClick=true,Func=function()
+    Library.SetAutoExecuteFlag(false)
+    pcall(function() if type(CleanUpScript)=="function" then CleanUpScript() end end)
+    pcall(function() Library:Unload() end)
+end})
 local LoadLocalProfile = InstallLocalProfiles(Library, ConfigTab)
 
 task.spawn(function()
@@ -16190,6 +16280,9 @@ do
             Library.PrepareTeleportSettings()
             writefile("LarpZeroProfiles/resume_pending.txt","1")
         end)
+        if Library.Toggles.AutoExecuteToggle and Library.Toggles.AutoExecuteToggle.Value then
+            pcall(Library.QueueAutoExecute)
+        end
     end)
     if type(isfile)=="function" and type(delfile)=="function" then
         pcall(function()
@@ -16199,7 +16292,7 @@ do
             end
         end)
     end
-    cleanSettings:AddLabel("Startup: executor auto-execute folder",true)
+    cleanSettings:AddLabel("Auto execute needs executor queue_on_teleport support",true)
 end
 if SV.RefreshSafeMode then SV.RefreshSafeMode(SV.SafeMode) end
 SetGlobal("creating UI functions")
@@ -17003,20 +17096,49 @@ if not IsMainMenu then
             end
         end)
     end)
+    SV.CrusaderBuffGeneration = 0
+    Toggles.CrusaderBuffToggle:OnChanged(function(enabled)
+        SV.CrusaderBuffGeneration = SV.CrusaderBuffGeneration + 1
+        local generation = SV.CrusaderBuffGeneration
+        if not enabled then return end
+        local rally = Remotes:FindFirstChild("Skillset_Crusader_Rally")
+        local armament = Remotes:FindFirstChild("Skillset_Crusader_Armament")
+        if not rally and not armament then
+            Toggles.CrusaderBuffToggle:SetValue(false)
+            Library:Notify("Crusader buff interface unavailable", 4)
+            return
+        end
+        task.spawn(function()
+            local lastRally, lastArmament = 0, 0
+            while generation == SV.CrusaderBuffGeneration and not KillSwitch
+                and not ScriptUnloaded and Toggles.CrusaderBuffToggle.Value do
+                local character = LocalPlayer.Character
+                local health = character and character:FindFirstChild("HealthProperties")
+                health = health and health:FindFirstChild("Health")
+                if health and health.Value > 0 then
+                    local now = os.clock()
+                    if rally and now - lastRally >= 6.2 then
+                        lastRally = now
+                        pcall(function() rally:FireServer() end)
+                    end
+                    if armament and now - lastArmament >= 11.2 then
+                        lastArmament = now
+                        pcall(function() armament:FireServer() end)
+                    end
+                end
+                task.wait(0.5)
+            end
+        end)
+    end)
     local MolBuff
     Toggles.MoLBarrierToggle:OnChanged(function(ChangedValue)
         if ChangedValue and SV.SafeMode and not IsDungeon then
             return
         end
-        if ChangedValue and LocalPlayer:GetAttribute("Class")~="MageOfLight" then
-            Toggles.MoLBarrierToggle:SetValue(false)
-            Library:Notify("This feature requires MageOfLight",4)
-            return
-        end
  -- mol barrier
         if ChangedValue then
             local Success, Result = pcall(function()
-                if SV.PlayerClass == "MageOfLight" then
+                if true then -- class check removed
                     MolBuff = true
                     local Barrier = Remotes:WaitForChild("Skillset_MageOfLight_Barrier")
                     while MolBuff do
@@ -17046,15 +17168,10 @@ if not IsMainMenu then
         if ChangedValue and SV.SafeMode and not IsDungeon then
             return
         end
-        if ChangedValue and LocalPlayer:GetAttribute("Class")~="Demon" then
-            Toggles.DemonBloodBindingToggle:SetValue(false)
-            Library:Notify("This feature requires Demon",4)
-            return
-        end
  -- demon blood binding
         if ChangedValue then
             local Success, Result = pcall(function()
-                if SV.PlayerClass == "Demon" then
+                if true then -- class check removed
                     DemonBuff = true
                     local BloodBinding = Remotes:WaitForChild("Skillset_Demon_BloodBinding")
                     while DemonBuff do
@@ -17081,15 +17198,10 @@ if not IsMainMenu then
         if ChangedValue and SV.SafeMode and not IsDungeon then
             return
         end
-        if ChangedValue and LocalPlayer:GetAttribute("Class")~="Stormcaller" then
-            Toggles.StormcallerSuperchargeToggle:SetValue(false)
-            Library:Notify("This feature requires Stormcaller",4)
-            return
-        end
  -- stormcaller supercharge
         if ChangedValue then
             local Success, Result = pcall(function()
-                if SV.PlayerClass == "Stormcaller" then
+                if true then -- class check removed
                     StormcallerBuff = true
                     local Supercharge = Remotes:WaitForChild("Skillset_Stormcaller_Supercharge", math.huge)
                     while StormcallerBuff do
